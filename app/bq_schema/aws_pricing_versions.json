@@ -1,0 +1,9 @@
+[
+  {"name": "service_code", "mode": "REQUIRED", "type": "STRING", "description": "AWS offer code (e.g. AmazonEC2) or savings plan code (e.g. AWSComputeSavingsPlan)."},
+  {"name": "region_code", "mode": "REQUIRED", "type": "STRING", "description": "AWS region code, or 'aws-global'."},
+  {"name": "offer_type", "mode": "REQUIRED", "type": "STRING", "description": "service | savings_plan."},
+  {"name": "version", "mode": "REQUIRED", "type": "STRING", "description": "AWS-supplied offer file version timestamp."},
+  {"name": "publication_date", "mode": "NULLABLE", "type": "TIMESTAMP"},
+  {"name": "loaded_at", "mode": "REQUIRED", "type": "TIMESTAMP"},
+  {"name": "source_url", "mode": "NULLABLE", "type": "STRING"}
+]

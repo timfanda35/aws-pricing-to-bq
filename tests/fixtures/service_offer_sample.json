@@ -1,0 +1,103 @@
+{
+  "formatVersion": "v1.0",
+  "disclaimer": "...",
+  "offerCode": "AmazonS3",
+  "version": "20260501000000",
+  "publicationDate": "2026-05-01T00:00:00Z",
+  "products": {
+    "SKU-A": {
+      "sku": "SKU-A",
+      "productFamily": "Storage",
+      "attributes": {
+        "servicecode": "AmazonS3",
+        "servicename": "Amazon Simple Storage Service",
+        "location": "US East (N. Virginia)",
+        "locationType": "AWS Region",
+        "storageClass": "General Purpose",
+        "volumeType": "Standard"
+      }
+    },
+    "SKU-B": {
+      "sku": "SKU-B",
+      "productFamily": "API Request",
+      "attributes": {
+        "servicecode": "AmazonS3",
+        "servicename": "Amazon Simple Storage Service",
+        "location": "US East (N. Virginia)",
+        "group": "S3-API-Tier1",
+        "operation": "PutObject"
+      }
+    }
+  },
+  "terms": {
+    "OnDemand": {
+      "SKU-A": {
+        "SKU-A.JRTCKXETXF": {
+          "offerTermCode": "JRTCKXETXF",
+          "sku": "SKU-A",
+          "effectiveDate": "2025-04-01T00:00:00Z",
+          "priceDimensions": {
+            "SKU-A.JRTCKXETXF.6YS6EN2CT7": {
+              "rateCode": "SKU-A.JRTCKXETXF.6YS6EN2CT7",
+              "description": "$0.023 per GB - first 50 TB / month of storage used",
+              "beginRange": "0",
+              "endRange": "51200",
+              "unit": "GB-Mo",
+              "pricePerUnit": {"USD": "0.0230000000"},
+              "appliesTo": []
+            },
+            "SKU-A.JRTCKXETXF.7YS6EN2CT7": {
+              "rateCode": "SKU-A.JRTCKXETXF.7YS6EN2CT7",
+              "description": "next 450 TB",
+              "beginRange": "51200",
+              "endRange": "Inf",
+              "unit": "GB-Mo",
+              "pricePerUnit": {"USD": "0.0220000000"}
+            }
+          },
+          "termAttributes": {}
+        }
+      },
+      "SKU-B": {
+        "SKU-B.JRTCKXETXF": {
+          "offerTermCode": "JRTCKXETXF",
+          "sku": "SKU-B",
+          "effectiveDate": "2025-04-01T00:00:00Z",
+          "priceDimensions": {
+            "SKU-B.JRTCKXETXF.RATE1": {
+              "rateCode": "SKU-B.JRTCKXETXF.RATE1",
+              "description": "$0.0001 per request",
+              "beginRange": "0",
+              "endRange": "Inf",
+              "unit": "Requests",
+              "pricePerUnit": {"USD": "1.0E-4"}
+            }
+          },
+          "termAttributes": {}
+        }
+      }
+    },
+    "Reserved": {
+      "SKU-A": {
+        "SKU-A.HU7G6KETJZ": {
+          "offerTermCode": "HU7G6KETJZ",
+          "sku": "SKU-A",
+          "effectiveDate": "2025-04-01T00:00:00Z",
+          "priceDimensions": {
+            "SKU-A.HU7G6KETJZ.6YS6EN2CT7": {
+              "rateCode": "SKU-A.HU7G6KETJZ.6YS6EN2CT7",
+              "description": "1 yr no upfront",
+              "unit": "GB-Mo",
+              "pricePerUnit": {"USD": "0.0180000000"}
+            }
+          },
+          "termAttributes": {
+            "LeaseContractLength": "1yr",
+            "OfferingClass": "standard",
+            "PurchaseOption": "No Upfront"
+          }
+        }
+      }
+    }
+  }
+}

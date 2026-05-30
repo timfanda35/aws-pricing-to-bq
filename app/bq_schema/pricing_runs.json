@@ -1,0 +1,12 @@
+[
+  {"name": "run_id", "mode": "REQUIRED", "type": "STRING", "description": "UUID hex of this load run; correlates with the GCS staging prefix."},
+  {"name": "started_at", "mode": "REQUIRED", "type": "TIMESTAMP"},
+  {"name": "finished_at", "mode": "NULLABLE", "type": "TIMESTAMP"},
+  {"name": "status", "mode": "REQUIRED", "type": "STRING", "description": "running | succeeded | failed"},
+  {"name": "rows_loaded", "mode": "NULLABLE", "type": "INT64"},
+  {"name": "services_changed", "mode": "NULLABLE", "type": "INT64", "description": "(service, region) pairs whose version differed and were re-fetched."},
+  {"name": "services_skipped", "mode": "NULLABLE", "type": "INT64", "description": "(service, region) pairs whose version was already loaded."},
+  {"name": "service_filter", "mode": "NULLABLE", "type": "STRING", "description": "AWS_SERVICE_FILTER value at run start."},
+  {"name": "ingestion_date", "mode": "NULLABLE", "type": "DATE"},
+  {"name": "error", "mode": "NULLABLE", "type": "STRING"}
+]

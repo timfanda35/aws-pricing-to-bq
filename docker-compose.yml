@@ -1,0 +1,17 @@
+services:
+  loader:
+    build: .
+    environment:
+      # GCP_PROJECT, BQ_DATASET, BQ_LOCATION, GCS_STAGING_BUCKET, GCS_STAGING_PREFIX
+      # are read from the host environment / .env file.
+      GOOGLE_APPLICATION_CREDENTIALS: /home/appuser/.config/gcloud/application_default_credentials.json
+      # Default to a narrow filter for fast smoke tests; remove for a full corpus load.
+      AWS_SERVICE_FILTER: ${AWS_SERVICE_FILTER:-AmazonS3}
+      AWS_INCLUDE_SAVINGS_PLANS: ${AWS_INCLUDE_SAVINGS_PLANS:-false}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    env_file:
+      - .env
+    volumes:
+      # Mount the host's gcloud ADC creds into the container so the job can
+      # authenticate to BigQuery + GCS without a service-account key file.
+      - ${HOME}/.config/gcloud:/home/appuser/.config/gcloud:ro

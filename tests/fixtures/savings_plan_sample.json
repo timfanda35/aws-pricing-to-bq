@@ -1,0 +1,49 @@
+{
+  "formatVersion": "v1.0",
+  "disclaimer": "...",
+  "offerCode": "AWSComputeSavingsPlan",
+  "version": "20260501000000",
+  "publicationDate": "2026-05-01T00:00:00Z",
+  "products": [
+    {
+      "sku": "SP-SKU-1",
+      "productFamily": "ComputeSavingsPlans",
+      "serviceCode": "ComputeSavingsPlans",
+      "usageType": "ComputeSP:1yrNoUpfront",
+      "attributes": {
+        "purchaseOption": "No Upfront",
+        "purchaseTerm": "1yr",
+        "granularity": "hourly",
+        "location": "US East (N. Virginia)",
+        "regionCode": "us-east-1"
+      }
+    }
+  ],
+  "terms": {
+    "savingsPlan": [
+      {
+        "sku": "SP-SKU-1",
+        "description": "1 year No Upfront Compute Savings Plan",
+        "effectiveDate": "2025-04-01T00:00:00Z",
+        "leaseContractLength": {"duration": 1, "unit": "year"},
+        "rates": [
+          {
+            "discountedSku": "EC2-SKU-1",
+            "discountedUsageType": "BoxUsage:m5.large",
+            "discountedOperation": "RunInstances",
+            "rateCode": "SP-SKU-1.RATE-A",
+            "unit": "Hrs",
+            "discountedRate": {"price": "0.0660000000", "unit": "Hrs"}
+          },
+          {
+            "discountedSku": "EC2-SKU-2",
+            "discountedUsageType": "BoxUsage:m5.xlarge",
+            "rateCode": "SP-SKU-1.RATE-B",
+            "unit": "Hrs",
+            "discountedRate": {"price": "0.1320000000", "unit": "Hrs"}
+          }
+        ]
+      }
+    ]
+  }
+}
