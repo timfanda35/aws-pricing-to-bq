@@ -113,7 +113,10 @@ The image's default `CMD` is `python run_job.py`, which is exactly what Cloud Ru
 
 ## Deployment (GCP)
 
-1. **Cloud Build → Artifact Registry** — image on push to `main`.
+1. **GitHub Actions → GHCR** — on every push to `main` (or a `v*` tag), the workflow in `.github/workflows/docker-publish.yml` runs `pytest` and, on success, builds and pushes the image to `ghcr.io/<owner>/<repo>`:
+   - `latest` — tracks the `main` branch
+   - `<semver>` — created when you push a `v*` tag (e.g. `v1.2.3`)
+
 2. **GCS staging bucket** — same region as the BQ dataset. **Add a lifecycle rule to delete objects older than 7 days** so failed-run debris cleans itself up.
 3. **Service account** for the Cloud Run Job:
    - `roles/bigquery.dataEditor` on the dataset
@@ -122,6 +125,7 @@ The image's default `CMD` is `python run_job.py`, which is exactly what Cloud Ru
 4. **Cloud Run Job** `aws-pricing-loader-job`:
    - **task timeout 3600s** (default 600s is too short for a full first load)
    - parallelism 1, max retries 1
+   - Image: `ghcr.io/<owner>/<repo>:latest` (or pin a semver tag)
    - `CMD ["python","run_job.py"]`
 5. **Cloud Scheduler**: daily 02:00 UTC → Cloud Run Job admin API with OIDC token (scheduler SA needs `roles/run.invoker`).
 
