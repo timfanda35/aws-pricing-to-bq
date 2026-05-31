@@ -1,4 +1,6 @@
+import gzip
 import json
+import shutil
 from pathlib import Path
 
 from app.services.aws_client import OfferTarget
@@ -276,6 +278,70 @@ def test_offer_file_to_rows_savings_plan_delegates_to_dict_path(tmp_path):
         )
     )
     assert in_mem == streamed
+
+
+def test_offer_file_to_rows_reads_gzipped_offer(tmp_path):
+    """Production downloads write gzip to /tmp to shrink Cloud Run's tmpfs RAM cost.
+
+    The transform layer detects gzip via magic bytes and reads transparently.
+    This test verifies round-trip parity: gzipped fixture yields identical
+    rows to the plain-JSON path.
+    """
+    plain_path = FIXTURES / "service_offer_sample.json"
+    gz_path = tmp_path / "service_offer_sample.json.gz"
+    with gzip.open(gz_path, "wb") as out:
+        with open(plain_path, "rb") as src:
+            shutil.copyfileobj(src, out)
+
+    target = _service_target()
+    from_plain = list(
+        offer_file_to_rows(
+            target,
+            str(plain_path),
+            ingestion_date_str="2026-05-01",
+            ingested_at_str="2026-05-01T00:00:00+00:00",
+        )
+    )
+    from_gz = list(
+        offer_file_to_rows(
+            target,
+            str(gz_path),
+            ingestion_date_str="2026-05-01",
+            ingested_at_str="2026-05-01T00:00:00+00:00",
+        )
+    )
+
+    def _sort_key(r):
+        return (r["rate_code"], r["term_type"])
+
+    assert sorted(from_plain, key=_sort_key) == sorted(from_gz, key=_sort_key)
+
+
+def test_offer_file_to_rows_reads_gzipped_savings_plan(tmp_path):
+    """Same round-trip parity for the savings-plan dispatch branch."""
+    plain_path = FIXTURES / "savings_plan_sample.json"
+    gz_path = tmp_path / "savings_plan_sample.json.gz"
+    with gzip.open(gz_path, "wb") as out, open(plain_path, "rb") as src:
+        shutil.copyfileobj(src, out)
+
+    target = _sp_target()
+    from_plain = list(
+        offer_file_to_rows(
+            target,
+            str(plain_path),
+            ingestion_date_str="2026-05-01",
+            ingested_at_str="2026-05-01T00:00:00+00:00",
+        )
+    )
+    from_gz = list(
+        offer_file_to_rows(
+            target,
+            str(gz_path),
+            ingestion_date_str="2026-05-01",
+            ingested_at_str="2026-05-01T00:00:00+00:00",
+        )
+    )
+    assert from_plain == from_gz
 
 
 def test_offer_file_to_rows_can_skip_reserved(tmp_path):

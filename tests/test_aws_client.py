@@ -278,6 +278,36 @@ def test_download_offer_to_file_streams_to_disk(settings, tmp_path):
 
 
 @responses.activate
+def test_download_offer_to_file_writes_gzip_when_path_ends_in_gz(settings, tmp_path):
+    """Cloud Run loader uses .json.gz to cut tmpfs (RAM) cost. Confirm the
+    download is actually gzipped — open with gzip and verify byte-identical
+    decompression to the wire body, plus a meaningful size reduction."""
+    import gzip
+
+    base = settings.aws_pricing_base_url
+    # Use a JSON body that compresses well so the size assertion is meaningful.
+    body = (b'{"products":' + b'{"S":' + b'"x" * 100' + b"}}") + b" " * 5000
+    url = f"{base}/offers/v1.0/aws/AmazonS3/v1/us-east-1/index.json"
+    responses.add(responses.GET, url, body=body, status=200)
+
+    target = aws_client.OfferTarget(
+        service_code="AmazonS3",
+        region_code="us-east-1",
+        offer_type="service",
+        version="v1",
+        offer_url=url,
+    )
+    dest = tmp_path / "offer.json.gz"
+    aws_client.download_offer_to_file(target, str(dest), settings)
+
+    # File on disk is smaller than the wire body (compression worked).
+    assert dest.stat().st_size < len(body)
+    # Round-trip: gunzipped content matches the original body byte-for-byte.
+    with gzip.open(dest, "rb") as f:
+        assert f.read() == body
+
+
+@responses.activate
 def test_download_offer_to_file_retries_on_5xx(settings, tmp_path):
     base = settings.aws_pricing_base_url
     url = f"{base}/offers/v1.0/aws/AmazonS3/v1/us-east-1/index.json"

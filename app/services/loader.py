@@ -144,8 +144,11 @@ def _download_one(
     """
     # One session per worker — keeps connection pools small and avoids cross-thread state.
     session = aws_client.make_session(settings)
+    # `.json.gz` triggers gzip-on-write inside `download_offer_to_file`. JSON
+    # compresses ~6-8x, which materially shrinks the tmpfs footprint on Cloud
+    # Run where /tmp is RAM-backed.
     with tempfile.NamedTemporaryFile(
-        mode="wb", delete=False, suffix=".json"
+        mode="wb", delete=False, suffix=".json.gz"
     ) as tmp:
         tmp_path = tmp.name
     try:

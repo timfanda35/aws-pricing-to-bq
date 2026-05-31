@@ -210,6 +210,38 @@ Granting another team read access:
 | `JSONL_BATCH_SIZE` | `10000` | items per uploaded JSONL file |
 | `LOG_LEVEL` | `INFO` | |
 
+## Memory budget on Cloud Run
+
+Cloud Run's `/tmp` is **tmpfs (RAM-backed)** — anything we write to disk counts
+against the instance's memory limit. The loader compensates by gzipping the
+downloaded offer JSON on tmpfs (transparently re-opened by the parser via
+magic-byte detection), which cuts that 6-8x. The dominant per-worker costs
+during an offer download:
+
+| Per worker (large offer in flight) | Cost |
+|---|---|
+| Downloaded offer JSON on `/tmp`, gzipped (EC2 us-east-1) | ~30 MB |
+| `products` lookup dict in Python (50K-100K SKUs × full attributes) | ~300 MB |
+| In-flight NDJSON temp file on `/tmp` | ~50 MB |
+| **Subtotal per worker** | **~380 MB** |
+
+With `AWS_MAX_WORKERS=3` and Python runtime + libraries (~300 MB), total peak
+is ~1.5 GB — fits comfortably in a 4 GiB instance. Sizing reference:
+
+| Cloud Run memory | Recommended `AWS_MAX_WORKERS` |
+|---|---|
+| 4 GiB | 3 (default) |
+| 8 GiB | 5–6 |
+| 16 GiB | 8–10 |
+
+`AWS_DISCOVER_WORKERS` controls concurrent `region_index.json` fetches and
+those responses are tiny — leave it at 10 regardless of instance size; it
+doesn't affect memory.
+
+OOM symptom in Cloud Logging looks like: container killed exit code 137,
+with the last `mem.snapshot` log showing peak_rss climbing past the limit
+during the parallel-download phase. If that happens, halve `AWS_MAX_WORKERS`.
+
 ## Observability
 
 - **Container-level memory**: `run.googleapis.com/container/memory/utilizations` in Cloud Monitoring — the source of truth for "did this job OOM". Cloud Run publishes this automatically, no instrumentation needed.

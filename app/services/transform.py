@@ -24,6 +24,7 @@ real JSON object / array, which is what query consumers expect.
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 from collections.abc import Iterator
@@ -209,6 +210,20 @@ def _flatten_service_offer(
             )
 
 
+def _open_offer_file(path: str):
+    """Open an offer JSON file for reading, transparently handling gzip.
+
+    The Cloud Run loader writes the offer to disk gzipped (saves tmpfs/RAM on
+    instances where /tmp is RAM-backed). Test fixtures are plain JSON. Detect
+    via the gzip magic bytes so callers don't need to care.
+    """
+    with open(path, "rb") as f:
+        magic = f.read(2)
+    if magic == b"\x1f\x8b":
+        return gzip.open(path, "rb")
+    return open(path, "rb")
+
+
 def _read_offer_metadata(path: str) -> dict:
     """Pull top-level scalar fields (version, publicationDate) without loading the body.
 
@@ -217,7 +232,7 @@ def _read_offer_metadata(path: str) -> dict:
     scanned end-to-end.
     """
     meta: dict = {}
-    with open(path, "rb") as f:
+    with _open_offer_file(path) as f:
         for prefix, event, value in ijson.parse(f):
             if event == "string" and prefix in (
                 "version",
@@ -257,7 +272,7 @@ def _flatten_service_offer_streaming(
     offer_meta = _read_offer_metadata(path)
     # Streaming products: ijson.kvitems yields (sku, product_dict) pairs lazily.
     products: dict = {}
-    with open(path, "rb") as f:
+    with _open_offer_file(path) as f:
         for sku, product in ijson.kvitems(f, "products"):
             products[sku] = product
 
@@ -266,7 +281,7 @@ def _flatten_service_offer_streaming(
         term_buckets.append("Reserved")
 
     for term_type in term_buckets:
-        with open(path, "rb") as f:
+        with _open_offer_file(path) as f:
             for sku, term_id_map in ijson.kvitems(f, f"terms.{term_type}"):
                 yield from _emit_service_rows_for_sku(
                     target=target,
@@ -382,7 +397,8 @@ def offer_file_to_rows(
     is reused — keeps the savings-plan flattening logic single-sourced.
     """
     if target.offer_type == "savings_plan":
-        with open(path, encoding="utf-8") as f:
+        # _open_offer_file returns a binary stream; json.load handles bytes via utf-8.
+        with _open_offer_file(path) as f:
             offer = json.load(f)
         yield from _flatten_savings_plan_offer(
             target, offer, ingestion_date_str, ingested_at_str

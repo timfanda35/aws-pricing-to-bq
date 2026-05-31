@@ -15,6 +15,7 @@ exposed through the master service index in a uniform way.
 
 from __future__ import annotations
 
+import gzip
 import logging
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -262,7 +263,9 @@ def discover_targets(
                 service_jobs.append((plan_code, path, "savings_plan"))
 
         targets: list[OfferTarget] = []
-        with ThreadPoolExecutor(max_workers=settings.aws_max_workers) as pool:
+        # Region-index fetches are tiny (~10 KB each) so they can run with
+        # higher concurrency than the offer downloads downstream.
+        with ThreadPoolExecutor(max_workers=settings.aws_discover_workers) as pool:
             futures = {
                 pool.submit(_fetch_region_index, settings, session, path): (
                     service_code,
@@ -386,7 +389,16 @@ def download_offer_to_file(
                     raise RetryableHTTPError(resp.status_code, ra_seconds)
                 resp.raise_for_status()
                 bytes_written = 0
-                with open(path, "wb") as out:
+                # Gzip-on-write at compresslevel=1: AWS offer JSON compresses ~6-8x,
+                # which materially reduces the tmpfs footprint on Cloud Run (where
+                # /tmp is RAM-backed). Level 1 keeps CPU overhead minimal — ~50-100
+                # MB/s on a modern core, negligible compared to network bandwidth.
+                opener = (
+                    gzip.open(path, "wb", compresslevel=1)
+                    if path.endswith(".gz")
+                    else open(path, "wb")
+                )
+                with opener as out:
                     for chunk in resp.iter_content(chunk_size=_DOWNLOAD_CHUNK_SIZE):
                         if chunk:
                             out.write(chunk)
