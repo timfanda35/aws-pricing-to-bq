@@ -92,30 +92,38 @@ def _stub_fetch_offer(offer):
     return MagicMock(return_value=offer)
 
 
-_SAMPLE_OFFER = {
-    "version": "v-new",
-    "publicationDate": "2026-05-01T00:00:00Z",
-    "products": {
-        "SKU": {"sku": "SKU", "productFamily": "X", "attributes": {"servicename": "X"}}
-    },
-    "terms": {
-        "OnDemand": {
-            "SKU": {
-                "SKU.T": {
-                    "offerTermCode": "T",
-                    "priceDimensions": {
-                        "SKU.T.R": {
-                            "rateCode": "SKU.T.R",
-                            "unit": "Hrs",
-                            "pricePerUnit": {"USD": "0.10"},
-                        }
-                    },
-                    "termAttributes": {},
-                }
-            }
-        }
-    },
+_SAMPLE_ROW = {
+    "ingestion_date": "2026-05-30",
+    "service_code": "AmazonS3",
+    "region_code": "us-east-1",
+    "version": "v1",
+    "offer_type": "service",
+    "sku": "SKU",
+    "rate_code": "SKU.T.R",
+    "term_type": "OnDemand",
+    "price_per_unit": "0.10",
+    "currency": "USD",
+    "unit": "Hrs",
+    "ingested_at": "2026-05-30T00:00:00+00:00",
 }
+
+
+def _patch_offer_io(rows=None):
+    """Patches the (download, parse) boundary used by `_download_one`.
+
+    The loader streams the offer to disk via `aws_client.download_offer_to_file`
+    and parses it incrementally via `transform.offer_file_to_rows`. Tests don't
+    want to hit the real disk / network, so both are stubbed: download is a
+    no-op returning a fake byte count, parse returns the supplied rows iter.
+    """
+    return (
+        patch.object(loader.aws_client, "download_offer_to_file", return_value=100),
+        patch.object(
+            loader.transform,
+            "offer_file_to_rows",
+            return_value=iter(rows if rows is not None else [_SAMPLE_ROW]),
+        ),
+    )
 
 
 def test_run_load_first_run_no_previous_partition(settings):
@@ -126,9 +134,11 @@ def test_run_load_first_run_no_previous_partition(settings):
     )
     gcs_client, deleted_prefixes = _mock_gcs_client()
 
+    download_patch, parse_patch = _patch_offer_io()
     with (
         patch.object(loader.aws_client, "discover_targets", return_value=targets),
-        patch.object(loader.aws_client, "fetch_offer_json", return_value=_SAMPLE_OFFER),
+        download_patch,
+        parse_patch,
         patch.object(loader, "upload_jsonl", return_value=1) as upload_mock,
     ):
         result = loader.run_load(
@@ -179,14 +189,16 @@ def test_run_load_skips_unchanged_targets(settings):
 
     with (
         patch.object(loader.aws_client, "discover_targets", return_value=targets),
-        patch.object(loader.aws_client, "fetch_offer_json") as fetch_mock,
+        patch.object(loader.aws_client, "download_offer_to_file") as download_mock,
+        patch.object(loader.transform, "offer_file_to_rows") as parse_mock,
         patch.object(loader, "upload_jsonl", return_value=1) as upload_mock,
     ):
         result = loader.run_load(
             settings=settings, bq_client=bq_client, gcs_client=gcs_client
         )
 
-    fetch_mock.assert_not_called()
+    download_mock.assert_not_called()
+    parse_mock.assert_not_called()
     upload_mock.assert_not_called()
     bq_client.load_table_from_uri.assert_not_called()
     # No swap, no carryforward, no version MERGE — just audit start + finish
@@ -213,8 +225,9 @@ def test_run_load_carries_forward_unchanged_pairs(settings):
 
     with (
         patch.object(loader.aws_client, "discover_targets", return_value=[t_changed, t_unchanged]),
-        patch.object(loader.aws_client, "fetch_offer_json", return_value=_SAMPLE_OFFER),
-        patch.object(loader, "upload_jsonl"),
+        patch.object(loader.aws_client, "download_offer_to_file", return_value=100),
+        patch.object(loader.transform, "offer_file_to_rows", return_value=iter([_SAMPLE_ROW])),
+        patch.object(loader, "upload_jsonl", return_value=1),
     ):
         result = loader.run_load(
             settings=settings, bq_client=bq_client, gcs_client=gcs_client
@@ -252,7 +265,8 @@ def test_run_load_force_ignores_known_versions(settings):
 
     with (
         patch.object(loader.aws_client, "discover_targets", return_value=targets),
-        patch.object(loader.aws_client, "fetch_offer_json", return_value=_SAMPLE_OFFER),
+        patch.object(loader.aws_client, "download_offer_to_file", return_value=100),
+        patch.object(loader.transform, "offer_file_to_rows", return_value=iter([_SAMPLE_ROW])),
         patch.object(loader, "upload_jsonl", return_value=1) as upload_mock,
     ):
         result = loader.run_load(
@@ -292,8 +306,9 @@ def test_run_load_load_job_error_leaves_state_intact(settings):
 
     with (
         patch.object(loader.aws_client, "discover_targets", return_value=targets),
-        patch.object(loader.aws_client, "fetch_offer_json", return_value=_SAMPLE_OFFER),
-        patch.object(loader, "upload_jsonl"),
+        patch.object(loader.aws_client, "download_offer_to_file", return_value=100),
+        patch.object(loader.transform, "offer_file_to_rows", return_value=iter([_SAMPLE_ROW])),
+        patch.object(loader, "upload_jsonl", return_value=1),
         pytest.raises(RuntimeError, match="BigQuery load job failed"),
     ):
         loader.run_load(settings=settings, bq_client=bq_client, gcs_client=gcs_client)

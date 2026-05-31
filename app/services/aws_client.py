@@ -320,13 +320,88 @@ def fetch_offer_json(
     settings: Settings | None = None,
     session: requests.Session | None = None,
 ) -> dict:
-    """Download a single offer file."""
+    """Download a single offer file fully into memory.
+
+    Convenient for small files and tests. The loader uses
+    `download_offer_to_file` instead so that ~200 MB EC2 offers can be parsed
+    incrementally rather than held as a single Python dict.
+    """
     settings = settings or get_settings()
     own = session is None
     session = session or make_session(settings)
     try:
         get = _build_get(settings, session)
         return get(target.offer_url)
+    finally:
+        if own:
+            session.close()
+
+
+# 1 MiB read chunks for streaming downloads — large enough for throughput,
+# small enough that a stuck connection surfaces quickly via timeout.
+_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+def download_offer_to_file(
+    target: OfferTarget,
+    path: str,
+    settings: Settings | None = None,
+    session: requests.Session | None = None,
+) -> int:
+    """Stream a single offer file to disk. Returns bytes written.
+
+    The whole-dict alternative (`fetch_offer_json`) builds a multi-hundred-MB
+    Python object for EC2 us-east-1 / RDS us-east-1, dwarfing the actual on-wire
+    size. Writing to disk first lets the caller decide whether to materialize
+    via `json.load` (fine for small files) or stream via `ijson` (the only
+    sane option for EC2-scale offers).
+
+    Retries on the same transient-HTTP failures as the rest of the AWS client.
+    """
+    settings = settings or get_settings()
+    own = session is None
+    session = session or make_session(settings)
+    try:
+
+        @retry(
+            retry=retry_if_exception_type(
+                (RetryableHTTPError, requests.ConnectionError, requests.Timeout)
+            ),
+            stop=stop_after_attempt(max(1, settings.aws_max_retries)),
+            wait=_honor_retry_after,
+            reraise=True,
+        )
+        def _download() -> int:
+            with session.get(
+                target.offer_url, timeout=settings.aws_request_timeout_s, stream=True
+            ) as resp:
+                if _is_retryable_status(resp.status_code):
+                    retry_after = resp.headers.get("Retry-After")
+                    ra_seconds: float | None = None
+                    if retry_after:
+                        try:
+                            ra_seconds = float(retry_after)
+                        except ValueError:
+                            ra_seconds = None
+                    raise RetryableHTTPError(resp.status_code, ra_seconds)
+                resp.raise_for_status()
+                bytes_written = 0
+                with open(path, "wb") as out:
+                    for chunk in resp.iter_content(chunk_size=_DOWNLOAD_CHUNK_SIZE):
+                        if chunk:
+                            out.write(chunk)
+                            bytes_written += len(chunk)
+            return bytes_written
+
+        n = _download()
+        logger.info(
+            "aws.offer.downloaded service=%s region=%s bytes=%d path=%s",
+            target.service_code,
+            target.region_code,
+            n,
+            path,
+        )
+        return n
     finally:
         if own:
             session.close()

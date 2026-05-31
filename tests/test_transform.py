@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from app.services.aws_client import OfferTarget
-from app.services.transform import offer_to_rows
+from app.services.transform import offer_file_to_rows, offer_to_rows
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -220,6 +220,77 @@ def test_json_columns_are_dicts_not_strings():
             assert isinstance(r["term_attributes"], dict)
         if r["price_per_unit_raw"] is not None:
             assert isinstance(r["price_per_unit_raw"], dict)
+
+
+def test_offer_file_to_rows_matches_offer_to_rows_for_service(tmp_path):
+    """Streaming parser must produce byte-identical rows to the in-memory parser.
+
+    Guards the row-building helper that's shared between the dict path and the
+    ijson streaming path — any divergence (e.g. forgetting to thread a field
+    through) would show up here as the streaming pass losing data on EC2 / RDS
+    in production.
+    """
+    target = _service_target()
+    in_mem = list(
+        offer_to_rows(
+            target,
+            _load("service_offer_sample.json"),
+            ingestion_date_str="2026-05-01",
+            ingested_at_str="2026-05-01T00:00:00+00:00",
+        )
+    )
+    streamed = list(
+        offer_file_to_rows(
+            target,
+            str(FIXTURES / "service_offer_sample.json"),
+            ingestion_date_str="2026-05-01",
+            ingested_at_str="2026-05-01T00:00:00+00:00",
+        )
+    )
+
+    # Sort by rate_code + term_type since iteration order isn't part of the
+    # contract (ijson yields products in file order, terms in nested order).
+    def _sort_key(r):
+        return (r["rate_code"], r["term_type"])
+
+    assert sorted(in_mem, key=_sort_key) == sorted(streamed, key=_sort_key)
+
+
+def test_offer_file_to_rows_savings_plan_delegates_to_dict_path(tmp_path):
+    """Savings-plan files are small + structurally different; reuse the dict path."""
+    target = _sp_target()
+    in_mem = list(
+        offer_to_rows(
+            target,
+            _load("savings_plan_sample.json"),
+            ingestion_date_str="2026-05-01",
+            ingested_at_str="2026-05-01T00:00:00+00:00",
+        )
+    )
+    streamed = list(
+        offer_file_to_rows(
+            target,
+            str(FIXTURES / "savings_plan_sample.json"),
+            ingestion_date_str="2026-05-01",
+            ingested_at_str="2026-05-01T00:00:00+00:00",
+        )
+    )
+    assert in_mem == streamed
+
+
+def test_offer_file_to_rows_can_skip_reserved(tmp_path):
+    target = _service_target()
+    rows = list(
+        offer_file_to_rows(
+            target,
+            str(FIXTURES / "service_offer_sample.json"),
+            ingestion_date_str="2026-05-01",
+            ingested_at_str="2026-05-01T00:00:00+00:00",
+            include_reserved=False,
+        )
+    )
+    assert rows
+    assert all(r["term_type"] == "OnDemand" for r in rows)
 
 
 def test_attributes_is_null_when_product_has_none():

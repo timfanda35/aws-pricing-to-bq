@@ -4,3 +4,4 @@ pydantic>=2.7
 pydantic-settings>=2.4
 requests>=2.32
 tenacity>=8.3
+ijson>=3.3

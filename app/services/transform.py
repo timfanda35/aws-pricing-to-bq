@@ -24,8 +24,11 @@ real JSON object / array, which is what query consumers expect.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Iterator
+
+import ijson
 
 from app.services.aws_client import OfferTarget
 
@@ -111,6 +114,62 @@ def _base_row(
     }
 
 
+def _emit_service_rows_for_sku(
+    target: OfferTarget,
+    offer_meta: dict,
+    sku: str,
+    product: dict,
+    term_type: str,
+    term_id_map: dict,
+    ingestion_date_str: str,
+    ingested_at_str: str,
+) -> Iterator[dict]:
+    """Yield one row per priceDimension across all terms of a single SKU.
+
+    `offer_meta` only needs to carry the top-level `version` / `publicationDate`
+    fields — the streaming path can construct it without holding the whole offer
+    dict in memory.
+    """
+    product_family = (product or {}).get("productFamily")
+    attributes = (product or {}).get("attributes")
+    for term_id, term in (term_id_map or {}).items():
+        offer_term_code = term.get("offerTermCode")
+        term_effective_date = term.get("effectiveDate")
+        term_attributes = term.get("termAttributes")
+        price_dimensions = term.get("priceDimensions") or {}
+        for _rate_id, pd in price_dimensions.items():
+            price_per_unit_raw = pd.get("pricePerUnit")
+            price, currency = _pick_currency(price_per_unit_raw)
+            row = _base_row(
+                target=target,
+                offer=offer_meta,
+                sku=sku,
+                product_family=product_family,
+                attributes=attributes,
+                ingestion_date_str=ingestion_date_str,
+                ingested_at_str=ingested_at_str,
+            )
+            row.update(
+                {
+                    "rate_code": pd.get("rateCode") or term_id,
+                    "offer_term_code": offer_term_code,
+                    "term_type": term_type,
+                    "price_per_unit": price,
+                    "currency": currency,
+                    "unit": pd.get("unit"),
+                    "starting_range": _coerce_range(pd.get("beginRange")),
+                    "ending_range": _coerce_range(pd.get("endRange")),
+                    "effective_date": (
+                        term_effective_date[:10] if term_effective_date else None
+                    ),
+                    "description": pd.get("description"),
+                    "term_attributes": _json_or_none(term_attributes),
+                    "price_per_unit_raw": _json_or_none(price_per_unit_raw),
+                }
+            )
+            yield row
+
+
 def _flatten_service_offer(
     target: OfferTarget,
     offer: dict,
@@ -119,6 +178,11 @@ def _flatten_service_offer(
     *,
     include_reserved: bool,
 ) -> Iterator[dict]:
+    """In-memory variant: takes a fully-loaded offer dict.
+
+    Used by tests and by `offer_to_rows()`. The loader uses the streaming
+    counterpart `_flatten_service_offer_streaming` instead.
+    """
     products: dict = offer.get("products") or {}
     terms: dict = offer.get("terms") or {}
 
@@ -126,48 +190,94 @@ def _flatten_service_offer(
     if include_reserved:
         term_buckets.append("Reserved")
 
+    offer_meta = {
+        "version": offer.get("version"),
+        "publicationDate": offer.get("publicationDate"),
+    }
     for term_type in term_buckets:
         sku_terms = terms.get(term_type) or {}
         for sku, term_id_map in sku_terms.items():
-            product = products.get(sku) or {}
-            product_family = product.get("productFamily")
-            attributes = product.get("attributes")
-            for term_id, term in (term_id_map or {}).items():
-                offer_term_code = term.get("offerTermCode")
-                term_effective_date = term.get("effectiveDate")
-                term_attributes = term.get("termAttributes")
-                price_dimensions = term.get("priceDimensions") or {}
-                for _rate_id, pd in price_dimensions.items():
-                    price_per_unit_raw = pd.get("pricePerUnit")
-                    price, currency = _pick_currency(price_per_unit_raw)
-                    row = _base_row(
-                        target=target,
-                        offer=offer,
-                        sku=sku,
-                        product_family=product_family,
-                        attributes=attributes,
-                        ingestion_date_str=ingestion_date_str,
-                        ingested_at_str=ingested_at_str,
-                    )
-                    row.update(
-                        {
-                            "rate_code": pd.get("rateCode") or term_id,
-                            "offer_term_code": offer_term_code,
-                            "term_type": term_type,
-                            "price_per_unit": price,
-                            "currency": currency,
-                            "unit": pd.get("unit"),
-                            "starting_range": _coerce_range(pd.get("beginRange")),
-                            "ending_range": _coerce_range(pd.get("endRange")),
-                            "effective_date": (
-                                term_effective_date[:10] if term_effective_date else None
-                            ),
-                            "description": pd.get("description"),
-                            "term_attributes": _json_or_none(term_attributes),
-                            "price_per_unit_raw": _json_or_none(price_per_unit_raw),
-                        }
-                    )
-                    yield row
+            yield from _emit_service_rows_for_sku(
+                target=target,
+                offer_meta=offer_meta,
+                sku=sku,
+                product=products.get(sku) or {},
+                term_type=term_type,
+                term_id_map=term_id_map,
+                ingestion_date_str=ingestion_date_str,
+                ingested_at_str=ingested_at_str,
+            )
+
+
+def _read_offer_metadata(path: str) -> dict:
+    """Pull top-level scalar fields (version, publicationDate) without loading the body.
+
+    Uses ijson to walk just the first scalar events. Stops once it sees the
+    container start for `products` or `terms` so EC2-scale files don't get
+    scanned end-to-end.
+    """
+    meta: dict = {}
+    with open(path, "rb") as f:
+        for prefix, event, value in ijson.parse(f):
+            if event == "string" and prefix in (
+                "version",
+                "publicationDate",
+                "offerCode",
+                "formatVersion",
+                "disclaimer",
+            ):
+                meta[prefix] = value
+            elif prefix in ("products", "terms") and event in (
+                "start_map",
+                "start_array",
+            ):
+                break
+    return meta
+
+
+def _flatten_service_offer_streaming(
+    target: OfferTarget,
+    path: str,
+    ingestion_date_str: str,
+    ingested_at_str: str,
+    *,
+    include_reserved: bool,
+) -> Iterator[dict]:
+    """Streaming variant: parses `products` and `terms` from disk incrementally.
+
+    Memory footprint is bounded by (size of `products` dict + one SKU's term map
+    at a time). For EC2 us-east-1 (~200 MB on disk, ~1M rows after flatten) this
+    keeps RSS down by an order of magnitude vs `json.load`.
+
+    Reads the offer file three times (once for metadata + scalars, once for
+    products, once per term bucket). With ijson's yajl2_c backend each pass is
+    streamed straight from disk; total wall-clock cost is roughly 1.5–2x a
+    single full json.load but with a fraction of the peak memory.
+    """
+    offer_meta = _read_offer_metadata(path)
+    # Streaming products: ijson.kvitems yields (sku, product_dict) pairs lazily.
+    products: dict = {}
+    with open(path, "rb") as f:
+        for sku, product in ijson.kvitems(f, "products"):
+            products[sku] = product
+
+    term_buckets = ["OnDemand"]
+    if include_reserved:
+        term_buckets.append("Reserved")
+
+    for term_type in term_buckets:
+        with open(path, "rb") as f:
+            for sku, term_id_map in ijson.kvitems(f, f"terms.{term_type}"):
+                yield from _emit_service_rows_for_sku(
+                    target=target,
+                    offer_meta=offer_meta,
+                    sku=sku,
+                    product=products.get(sku) or {},
+                    term_type=term_type,
+                    term_id_map=term_id_map,
+                    ingestion_date_str=ingestion_date_str,
+                    ingested_at_str=ingested_at_str,
+                )
 
 
 def _products_index(products) -> dict:
@@ -240,7 +350,12 @@ def offer_to_rows(
     ingested_at_str: str,
     include_reserved: bool = True,
 ) -> Iterator[dict]:
-    """Dispatcher: flatten a single AWS offer JSON document into NDJSON rows."""
+    """In-memory dispatcher: flatten an already-loaded offer dict into NDJSON rows.
+
+    Used by tests and any small-offer path. Production loads (where EC2 us-east-1
+    can be ~200 MB) should use `offer_file_to_rows` to parse from disk and avoid
+    holding the whole offer in memory.
+    """
     if target.offer_type == "savings_plan":
         yield from _flatten_savings_plan_offer(
             target, offer, ingestion_date_str, ingested_at_str
@@ -248,4 +363,35 @@ def offer_to_rows(
     else:
         yield from _flatten_service_offer(
             target, offer, ingestion_date_str, ingested_at_str, include_reserved=include_reserved
+        )
+
+
+def offer_file_to_rows(
+    target: OfferTarget,
+    path: str,
+    *,
+    ingestion_date_str: str,
+    ingested_at_str: str,
+    include_reserved: bool = True,
+) -> Iterator[dict]:
+    """Streaming dispatcher: flatten an offer JSON file from disk.
+
+    For service offers, parses incrementally with ijson so memory stays bounded
+    by the size of the `products` lookup dict (~tens of MB for EC2). For savings
+    plans the file is small enough that `json.load` is fine and the dict path
+    is reused — keeps the savings-plan flattening logic single-sourced.
+    """
+    if target.offer_type == "savings_plan":
+        with open(path, encoding="utf-8") as f:
+            offer = json.load(f)
+        yield from _flatten_savings_plan_offer(
+            target, offer, ingestion_date_str, ingested_at_str
+        )
+    else:
+        yield from _flatten_service_offer_streaming(
+            target,
+            path,
+            ingestion_date_str,
+            ingested_at_str,
+            include_reserved=include_reserved,
         )

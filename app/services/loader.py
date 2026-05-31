@@ -20,7 +20,9 @@ until everything is consistent.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -126,29 +128,48 @@ def _download_one(
     ingestion_date_str: str,
     ingested_at_str: str,
 ) -> int:
-    """Download a single offer file, transform, stream-upload NDJSON. Returns row count.
+    """Download offer JSON to a temp file, stream-flatten, stream-upload NDJSON.
 
-    Rows are passed to `upload_jsonl` as a generator so memory stays bounded —
-    AWSComputeSavingsPlan/us-east-1 alone produces ~850K rows and the EC2 us-east-1
-    offer is roughly an order of magnitude larger.
+    Two memory bounds in series:
+      1) the offer JSON itself is never fully materialized in Python — it lands
+         on disk via requests' iter_content, then ijson walks it incrementally
+         (one (sku, term_id_map) pair at a time) for service offers
+      2) `upload_jsonl` accepts a generator and streams rows through its own
+         temp file before chunked resumable upload
+
+    Both bounds matter for EC2 us-east-1 (~200 MB JSON, ~1M+ flattened rows) and
+    similar large offers. Without these the worker process would briefly hold the
+    full offer dict (>1 GB Python heap) plus a fully-buffered NDJSON BytesIO.
     """
     # One session per worker — keeps connection pools small and avoids cross-thread state.
     session = aws_client.make_session(settings)
+    with tempfile.NamedTemporaryFile(
+        mode="wb", delete=False, suffix=".json"
+    ) as tmp:
+        tmp_path = tmp.name
     try:
-        offer = aws_client.fetch_offer_json(target, settings, session=session)
-        rows_iter = transform.offer_to_rows(
-            target,
-            offer,
-            ingestion_date_str=ingestion_date_str,
-            ingested_at_str=ingested_at_str,
-            include_reserved=settings.aws_include_reserved,
-        )
-        blob_name = f"{staging_prefix}{_safe_blob_name(target)}.jsonl"
-        rows_written = upload_jsonl(
-            gcs_client, settings.gcs_staging_bucket, blob_name, rows_iter
-        )
+        try:
+            aws_client.download_offer_to_file(
+                target, tmp_path, settings, session=session
+            )
+            rows_iter = transform.offer_file_to_rows(
+                target,
+                tmp_path,
+                ingestion_date_str=ingestion_date_str,
+                ingested_at_str=ingested_at_str,
+                include_reserved=settings.aws_include_reserved,
+            )
+            blob_name = f"{staging_prefix}{_safe_blob_name(target)}.jsonl"
+            rows_written = upload_jsonl(
+                gcs_client, settings.gcs_staging_bucket, blob_name, rows_iter
+            )
+        finally:
+            session.close()
     finally:
-        session.close()
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
     if rows_written == 0:
         logger.info(
             "loader.target.empty service=%s region=%s version=%s",

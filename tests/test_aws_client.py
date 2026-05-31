@@ -255,6 +255,50 @@ def test_extract_version_from_offer_url():
     assert aws_client._extract_version_from_offer_url(sp) == "20260101000000"
 
 
+@responses.activate
+def test_download_offer_to_file_streams_to_disk(settings, tmp_path):
+    """Body is written via streamed iter_content, not buffered into a Python dict."""
+    base = settings.aws_pricing_base_url
+    body = b'{"version":"v1","products":{"X":{"sku":"X"}},"terms":{}}'
+    url = f"{base}/offers/v1.0/aws/AmazonS3/v1/us-east-1/index.json"
+    responses.add(responses.GET, url, body=body, status=200)
+
+    target = aws_client.OfferTarget(
+        service_code="AmazonS3",
+        region_code="us-east-1",
+        offer_type="service",
+        version="v1",
+        offer_url=url,
+    )
+    dest = tmp_path / "offer.json"
+    n = aws_client.download_offer_to_file(target, str(dest), settings)
+
+    assert n == len(body)
+    assert dest.read_bytes() == body
+
+
+@responses.activate
+def test_download_offer_to_file_retries_on_5xx(settings, tmp_path):
+    base = settings.aws_pricing_base_url
+    url = f"{base}/offers/v1.0/aws/AmazonS3/v1/us-east-1/index.json"
+    responses.add(responses.GET, url, status=503)
+    responses.add(responses.GET, url, body=b'{"version":"v1"}', status=200)
+
+    target = aws_client.OfferTarget(
+        service_code="AmazonS3",
+        region_code="us-east-1",
+        offer_type="service",
+        version="v1",
+        offer_url=url,
+    )
+    dest = tmp_path / "offer.json"
+    with patch("time.sleep"):
+        n = aws_client.download_offer_to_file(target, str(dest), settings)
+
+    assert n > 0
+    assert len(responses.calls) == 2
+
+
 def test_proxy_settings_applied_to_session(settings):
     settings.http_proxy = "http://proxy.example.com:8080"
     settings.https_proxy = "https://proxy.example.com:8080"
