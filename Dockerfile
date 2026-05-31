@@ -14,6 +14,17 @@ ENV PATH="/opt/venv/bin:${PATH}"
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
+# Fail the build if ijson didn't land its C backend. The manylinux wheel bundles
+# its own libyajl, so on python:3.12-slim (Debian glibc) this should Just Work —
+# but if a future base-image change loses wheel compatibility, ijson silently
+# falls back to a pure-Python parser that's 3-10x slower on EC2-class offers.
+# Better a loud build failure than a slow Cloud Run Job.
+RUN python -c "import ijson, sys; \
+  backend = ijson.backend; \
+  print(f'ijson backend at build time: {backend}'); \
+  sys.exit(0 if backend == 'yajl2_c' else \
+    f'ijson backend is {backend!r}, expected yajl2_c. Install libyajl-dev or pin a wheel-compatible ijson version.')"
+
 ## Runtime stage
 FROM python:3.12-slim AS runtime
 

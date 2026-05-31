@@ -206,6 +206,14 @@ Granting another team read access:
 | `JSONL_BATCH_SIZE` | `10000` | items per uploaded JSONL file |
 | `LOG_LEVEL` | `INFO` | |
 
+## Observability
+
+- **Container-level memory**: `run.googleapis.com/container/memory/utilizations` in Cloud Monitoring — the source of truth for "did this job OOM". Cloud Run publishes this automatically, no instrumentation needed.
+- **Per-stage RSS in logs**: every run emits structured `mem.snapshot` log lines at start, after discovery, after the parallel download pool, after the LOAD JOB, after the live-table swap, and per `(service, region)` target. Useful when you need to figure out *which stage* of a load drove the peak — the container metric tells you peak but not why.
+  - Sample log line: `mem.snapshot label=download.done rss_mb=412.3 peak_rss_mb=415.7 service=AmazonEC2 region=us-east-1 rows=1234567`
+  - Grep `mem.snapshot` in Cloud Logging Explorer to see the full profile of a run.
+- **Runtime banner**: first log line of every job records Python version and the active `ijson.backend`. If a future image change loses the C wheel and falls back to the pure-Python parser (3-10x slower on EC2 us-east-1), you'll see it at a glance.
+
 ## Design notes
 
 - **Per-(service, region) version diff**: the heart of the incremental story. The full AWS dataset is ~5–10 GB but most files are unchanged on any given day.

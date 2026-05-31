@@ -9,8 +9,11 @@ import logging
 import sys
 import time
 
+import ijson
+
 from app import bq_setup
 from app.config import get_settings
+from app.diagnostics import log_memory
 from app.services import loader
 
 
@@ -20,6 +23,22 @@ def _configure_logging() -> None:
         level=settings.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+
+def _log_runtime_banner() -> None:
+    """One self-evident audit line at the top of every Cloud Run job.
+
+    The `ijson.backend` value is the thing we most care about — if a future image
+    rebuild loses the libyajl wheel and falls back to the pure-Python parser,
+    we want it screaming in the logs rather than silently 3-10x slower.
+    """
+    py = ".".join(str(x) for x in sys.version_info[:3])
+    logging.getLogger("run_job").info(
+        "runtime.banner python=%s ijson_backend=%s",
+        py,
+        ijson.backend,
+    )
+    log_memory("process.start")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _configure_logging()
+    _log_runtime_banner()
     started = time.monotonic()
     settings = get_settings()
     if args.service_filter is not None:

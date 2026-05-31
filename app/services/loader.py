@@ -38,6 +38,7 @@ from app.bq_setup import (
     VERSIONS_TABLE,
 )
 from app.config import Settings, get_settings
+from app.diagnostics import log_memory
 from app.gcs_client import delete_prefix, get_gcs_client, upload_jsonl
 from app.services import aws_client, transform
 from app.services import runs as runs_service
@@ -184,6 +185,14 @@ def _download_one(
             target.region_code,
             rows_written,
         )
+    # Per-target memory snapshot: lets us correlate peak RSS with the largest
+    # offers (EC2 / RDS us-east-1) when post-morteming a Cloud Run log stream.
+    log_memory(
+        "download.done",
+        service=target.service_code,
+        region=target.region_code,
+        rows=rows_written,
+    )
     return rows_written
 
 
@@ -344,6 +353,7 @@ def run_load(
         settings.aws_service_filter or None,
         force,
     )
+    log_memory("run.start", run_id=run_id)
 
     runs_service.start_run(
         bq_client,
@@ -378,6 +388,12 @@ def run_load(
             len(changed),
             skipped,
             force,
+        )
+        log_memory(
+            "discovery.done",
+            targets=len(targets),
+            changed=len(changed),
+            skipped=skipped,
         )
 
         previous_date = _latest_previous_partition(bq_client, settings, run_date)
@@ -422,6 +438,7 @@ def run_load(
                 }
                 for fut in as_completed(futs):
                     rows_loaded += fut.result()
+            log_memory("downloads.done", rows=rows_loaded)
 
             if rows_loaded == 0:
                 # Every changed target returned zero rows — very suspicious; bail out
@@ -464,6 +481,7 @@ def run_load(
                 load_job.job_id,
                 getattr(load_job, "output_rows", None),
             )
+            log_memory("load_job.done")
         else:
             # Nothing to LOAD this run, but we still need a clean today's partition so the
             # carryforward INSERT below can populate it deterministically. WRITE_TRUNCATE
@@ -494,6 +512,7 @@ def run_load(
 
         # ---- 8) Atomic swap of live table ----
         _swap_live_table(bq_client, settings, run_date)
+        log_memory("swap.done")
 
         # ---- 9) Clean up GCS staging on success ----
         delete_prefix(gcs_client, settings.gcs_staging_bucket, staging_prefix)
@@ -525,6 +544,7 @@ def run_load(
         skipped,
         elapsed,
     )
+    log_memory("run.complete", rows=rows_loaded, elapsed_s=f"{elapsed:.1f}")
     return LoadResult(
         run_id=run_id,
         run_date=run_date,
