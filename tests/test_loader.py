@@ -249,6 +249,77 @@ def test_run_load_carries_forward_unchanged_pairs(settings):
     assert params["previous_date"].value == date(2026, 5, 26)
     assert params["changed_csv"].value == "AmazonEC2|us-east-1"
 
+    # LOAD JOB on the new-day path must also be WRITE_APPEND so the
+    # carry-forward rows we just inserted aren't wiped.
+    cfg: bigquery.LoadJobConfig = bq_client.load_table_from_uri.call_args.kwargs["job_config"]
+    assert cfg.write_disposition == bigquery.WriteDisposition.WRITE_APPEND
+
+    # No targeted DELETE on the new-day path — today's partition started empty.
+    assert not any(
+        "DELETE FROM" in s and "@run_date" in s and "@changed_csv" in s for s in sqls
+    )
+
+    assert result.services_changed == 1
+    assert result.services_skipped == 1
+
+
+def test_run_load_same_day_rerun_preserves_unchanged(settings):
+    """Same-day reruns must NOT wipe unchanged services from today's partition.
+
+    Regression: the original implementation used WRITE_TRUNCATE on the LOAD JOB.
+    When run a second time on the same UTC day, today's partition was wiped
+    before the (few) changed targets were appended, and the carry-forward step
+    couldn't restore the rest because `_latest_previous_partition` only sees
+    `ingestion_date < today`. Result: unchanged services disappeared from the
+    live table.
+
+    Fix: WRITE_APPEND on the LOAD JOB + a targeted DELETE that only removes
+    today's rows for the changed (service, region) pairs.
+    """
+    t_changed = _target("AmazonEC2", "us-east-1", "v2")
+    t_unchanged = _target("AmazonRDS", "us-east-1", "v9")
+    bq_client, _ = _mock_bq_client(
+        known_versions=[("AmazonRDS", "us-east-1", "service", "v9")],
+        previous_date=None,  # No yesterday partition — same-day rerun case.
+        today_has_data=True,  # First run earlier today already populated today.
+    )
+    gcs_client, _ = _mock_gcs_client()
+
+    with (
+        patch.object(loader.aws_client, "discover_targets", return_value=[t_changed, t_unchanged]),
+        patch.object(loader.aws_client, "download_offer_to_file", return_value=100),
+        patch.object(loader.transform, "offer_file_to_rows", return_value=iter([_SAMPLE_ROW])),
+        patch.object(loader, "upload_jsonl", return_value=1),
+    ):
+        result = loader.run_load(
+            settings=settings, bq_client=bq_client, gcs_client=gcs_client
+        )
+
+    # ---- LOAD JOB must be WRITE_APPEND ----
+    bq_client.load_table_from_uri.assert_called_once()
+    cfg: bigquery.LoadJobConfig = bq_client.load_table_from_uri.call_args.kwargs["job_config"]
+    assert cfg.write_disposition == bigquery.WriteDisposition.WRITE_APPEND, (
+        "WRITE_TRUNCATE here would wipe today's unchanged rows — never use it"
+    )
+
+    # ---- A targeted DELETE for changed-only must run against today's partition ----
+    delete_calls = [
+        c
+        for c in bq_client.query.call_args_list
+        if "DELETE FROM" in c.args[0]
+        and "@run_date" in c.args[0]
+        and "@changed_csv" in c.args[0]
+    ]
+    assert len(delete_calls) == 1, "expected exactly one targeted DELETE in today's partition"
+    params = {p.name: p for p in delete_calls[0].kwargs["job_config"].query_parameters}
+    assert params["changed_csv"].value == "AmazonEC2|us-east-1"
+
+    # ---- No carry-forward INSERT (there's no previous_date AND today already has data) ----
+    sqls = [c.args[0] for c in bq_client.query.call_args_list]
+    assert not any(
+        "INSERT INTO" in s and "@previous_date" in s and "@changed_csv" in s for s in sqls
+    ), "carry-forward should not run on same-day rerun"
+
     assert result.services_changed == 1
     assert result.services_skipped == 1
 

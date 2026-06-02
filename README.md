@@ -30,6 +30,20 @@ So every run:
 
 A typical day moves a few hundred MB at most.
 
+### Same-day reruns
+
+The loader is safe to run multiple times on the same UTC day. On the second
+run, today's partition already has data from the first run, so:
+
+1. The loader DELETEs only the rows for `(service, region)` pairs whose AWS
+   version changed since the first run.
+2. The LOAD JOB then APPENDs fresh rows for those pairs.
+3. The live `aws_pricing` table is rebuilt at the end via `CREATE OR REPLACE`.
+
+Unchanged pairs are never touched. (Earlier versions of the loader used
+WRITE_TRUNCATE on the LOAD JOB and would wipe unchanged data on same-day
+reruns — fixed.)
+
 ## Schema strategy: one table, JSON for the variable parts
 
 AWS pricing data is notoriously irregular — `products[*].attributes` varies per service (EC2 has `instanceType/vcpu/memory`; S3 has `storageClass`; RDS has `engineCode`; ...) and AWS adds new keys without warning.

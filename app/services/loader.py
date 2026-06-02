@@ -6,9 +6,13 @@ handful change per day. We:
 1. List every (service, region) target from AWS' master + region indices.
 2. Compare each target's `version` against `aws_pricing_versions`.
 3. Download only the changed targets, in parallel, into GCS NDJSON.
-4. LOAD those NDJSON files into today's history partition (WRITE_TRUNCATE).
-5. Carry forward unchanged (service, region) rows from the most recent prior
-   partition into today's partition with `INSERT ... SELECT * REPLACE (ingestion_date)`.
+4. Prepare today's partition:
+   - same-day rerun (today already has rows): DELETE only the rows for the
+     changed (service, region) pairs — unchanged ones stay.
+   - new day: carry forward yesterday's rows for unchanged pairs into today's
+     partition with `INSERT ... AS ingestion_date = @run_date`.
+5. LOAD the changed NDJSON files into today's history partition with
+   WRITE_APPEND. TRUNCATE here would wipe the data set up in step 4.
 6. MERGE the new (service, region, version) tuples into `aws_pricing_versions`.
 7. `CREATE OR REPLACE TABLE aws_pricing` from today's partition.
 8. Delete GCS staging.
@@ -215,6 +219,39 @@ _HISTORY_COLS = (
 )
 
 
+def _delete_changed_from_today(
+    bq_client: bigquery.Client,
+    settings: Settings,
+    run_date: date,
+    changed_csv: str,
+) -> None:
+    """Drop today's rows for `(service, region)` pairs we're about to re-load.
+
+    Used on same-day reruns: today's partition has rows from an earlier run, and
+    we want to replace JUST the changed pairs while leaving the unchanged ones
+    untouched. Without this, the LOAD JOB (now WRITE_APPEND) would duplicate
+    rows for the changed pairs.
+    """
+    sql = (
+        f"DELETE FROM {_table_fqn(settings, HISTORY_TABLE)} "
+        f"WHERE ingestion_date = @run_date "
+        f"  AND CONCAT(service_code, '|', region_code) IN UNNEST(SPLIT(@changed_csv, ','))"
+    )
+    bq_client.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("run_date", "DATE", run_date),
+                bigquery.ScalarQueryParameter("changed_csv", "STRING", changed_csv),
+            ]
+        ),
+    ).result()
+    logger.info(
+        "bq.history.deleted_changed_in_today pairs=%d",
+        changed_csv.count(",") + 1 if changed_csv else 0,
+    )
+
+
 def _carry_forward_previous_partition(
     bq_client: bigquery.Client,
     settings: Settings,
@@ -225,7 +262,7 @@ def _carry_forward_previous_partition(
     """Copy unchanged (service, region) rows from previous_date into today's partition.
 
     Rows whose (service_code|region_code) appears in @changed_csv are SKIPPED
-    here because they were already replaced by the LOAD JOB.
+    here because they will be re-loaded by the LOAD JOB.
     """
     sql = (
         f"INSERT INTO {_table_fqn(settings, HISTORY_TABLE)} "
@@ -450,7 +487,33 @@ def run_load(
                     "Downloaded changed targets but produced zero rows; refusing to update."
                 )
 
-        # ---- 5) LOAD JOB into today's history partition ----
+        # ---- 5) Prepare today's partition for the LOAD JOB ----
+        #
+        # We must NOT use WRITE_TRUNCATE on the LOAD JOB. If a previous run
+        # already populated today (same-day rerun), TRUNCATE would wipe all the
+        # unchanged services' rows; `_latest_previous_partition` only sees
+        # `ingestion_date < today`, so the carry-forward step couldn't restore
+        # them. Result: live table ends up with only the changed services and
+        # the unchanged ones disappear.
+        #
+        # Instead: split into two cases and use WRITE_APPEND on the LOAD JOB.
+        #   - same-day rerun (today_has_data=True): DELETE today's rows for the
+        #     changed (service, region) pairs only — unchanged rows stay put.
+        #   - new day (today_has_data=False): carry forward yesterday's rows
+        #     for unchanged pairs into today's partition, then append the
+        #     changed ones from the LOAD JOB.
+        changed_csv = _csv_of_changed_pairs(changed)
+        if today_has_data:
+            if changed:
+                _delete_changed_from_today(bq_client, settings, run_date, changed_csv)
+        elif previous_date:
+            _carry_forward_previous_partition(
+                bq_client, settings, run_date, previous_date, changed_csv
+            )
+        # else: first-ever run, no historical partitions to carry from; today
+        # stays empty until the LOAD JOB below appends the changed (= all) rows.
+
+        # ---- 6) LOAD JOB appends changed rows to today's history partition ----
         partition_decorator = run_date.strftime("%Y%m%d")
         destination = (
             f"{settings.gcp_project}.{settings.bq_dataset}."
@@ -462,7 +525,8 @@ def run_load(
             schema = bq_client.schema_from_json(str(HISTORY_SCHEMA_PATH))
             job_config = bigquery.LoadJobConfig(
                 source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                # APPEND, not TRUNCATE — see comment on step 5 above.
+                write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
                 schema=schema,
             )
             load_job = bq_client.load_table_from_uri(
@@ -485,29 +549,6 @@ def run_load(
                 getattr(load_job, "output_rows", None),
             )
             log_memory("load_job.done")
-        else:
-            # Nothing to LOAD this run, but we still need a clean today's partition so the
-            # carryforward INSERT below can populate it deterministically. WRITE_TRUNCATE
-            # on the decorator is a no-op when the partition is empty.
-            clear_sql = (
-                f"DELETE FROM {_table_fqn(settings, HISTORY_TABLE)} "
-                f"WHERE ingestion_date = @run_date"
-            )
-            bq_client.query(
-                clear_sql,
-                job_config=bigquery.QueryJobConfig(
-                    query_parameters=[
-                        bigquery.ScalarQueryParameter("run_date", "DATE", run_date)
-                    ]
-                ),
-            ).result()
-
-        # ---- 6) Carry forward unchanged rows from the previous partition ----
-        changed_csv = _csv_of_changed_pairs(changed)
-        if previous_date:
-            _carry_forward_previous_partition(
-                bq_client, settings, run_date, previous_date, changed_csv
-            )
 
         # ---- 7) Upsert version state for changed targets ----
         if changed:
