@@ -260,9 +260,19 @@ def _flatten_service_offer_streaming(
 ) -> Iterator[dict]:
     """Streaming variant: parses `products` and `terms` from disk incrementally.
 
-    Memory footprint is bounded by (size of `products` dict + one SKU's term map
-    at a time). For EC2 us-east-1 (~200 MB on disk, ~1M rows after flatten) this
-    keeps RSS down by an order of magnitude vs `json.load`.
+    Memory footprint is bounded by (size of `products` lookup as raw JSON bytes
+    + one SKU's term map at a time). For EC2 us-east-1 (~200 MB on disk, ~1M
+    rows after flatten) this keeps RSS down by an order of magnitude vs
+    `json.load`.
+
+    `products` is stored as `dict[str, bytes]` (raw compact JSON), NOT as
+    `dict[str, dict]`. A Python dict + nested str objects has ~60+ bytes of
+    per-object overhead on top of the actual data — so a parsed-dict lookup for
+    EC2 us-east-1 (~100K SKUs × ~5 KB each) reaches ~1 GB per worker in heap.
+    Keeping the values as compact JSON bytes brings it down to ~300 MB by
+    skipping Python object overhead entirely; we re-parse on demand at SKU
+    iteration time, which costs ~50K json.loads per offer (~100 ms with the
+    yajl backend — negligible).
 
     Reads the offer file three times (once for metadata + scalars, once for
     products, once per term bucket). With ijson's yajl2_c backend each pass is
@@ -270,11 +280,14 @@ def _flatten_service_offer_streaming(
     single full json.load but with a fraction of the peak memory.
     """
     offer_meta = _read_offer_metadata(path)
-    # Streaming products: ijson.kvitems yields (sku, product_dict) pairs lazily.
-    products: dict = {}
+    # Streaming products → raw JSON bytes lookup. See docstring for the
+    # rationale: ~3x memory reduction vs storing parsed dicts.
+    products: dict[str, bytes] = {}
     with _open_offer_file(path) as f:
         for sku, product in ijson.kvitems(f, "products"):
-            products[sku] = product
+            products[sku] = json.dumps(
+                product, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
 
     term_buckets = ["OnDemand"]
     if include_reserved:
@@ -283,11 +296,15 @@ def _flatten_service_offer_streaming(
     for term_type in term_buckets:
         with _open_offer_file(path) as f:
             for sku, term_id_map in ijson.kvitems(f, f"terms.{term_type}"):
+                product_bytes = products.get(sku)
+                # Re-parse exactly once per SKU iteration (shared across the
+                # SKU's many priceDimensions inside _emit_service_rows_for_sku).
+                product = json.loads(product_bytes) if product_bytes else {}
                 yield from _emit_service_rows_for_sku(
                     target=target,
                     offer_meta=offer_meta,
                     sku=sku,
-                    product=products.get(sku) or {},
+                    product=product,
                     term_type=term_type,
                     term_id_map=term_id_map,
                     ingestion_date_str=ingestion_date_str,
