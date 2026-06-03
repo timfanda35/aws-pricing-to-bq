@@ -338,6 +338,64 @@ def _merge_versions(
     logger.info("bq.versions.merged run_date=%s", run_date)
 
 
+def _upsert_empty_target_versions(
+    bq_client: bigquery.Client,
+    settings: Settings,
+    empty_targets: list[aws_client.OfferTarget],
+) -> None:
+    """Record version state for targets whose offer file legitimately has zero rows.
+
+    Some AWS services publish "shell" offer files — valid JSON with empty
+    `terms.OnDemand` / `terms.Reserved` maps (AmazonQuickSuite us-east-1 is one
+    example as of 2026-06). The flatten step produces zero rows for them, so
+    `_merge_versions` (which derives version from history) can't update them
+    either — and they get re-fetched on every subsequent run forever.
+
+    This helper writes their version directly from the in-memory `changed` list
+    so the version-diff actually advances.
+    """
+    if not empty_targets:
+        return
+    # Pipe-delimited rows passed as a single STRING param. AWS service codes,
+    # region codes, offer types, and version timestamps are all alphanumeric +
+    # dashes; offer URLs are HTTPS paths without pipes. So '|' is a safe delim.
+    rows_csv = "\n".join(
+        f"{t.service_code}|{t.region_code}|{t.offer_type}|{t.version}|{t.offer_url}"
+        for t in empty_targets
+    )
+    sql = (
+        f"MERGE {_table_fqn(settings, VERSIONS_TABLE)} T "
+        f"USING ( "
+        f"  SELECT "
+        f"    SPLIT(line, '|')[OFFSET(0)] AS service_code, "
+        f"    SPLIT(line, '|')[OFFSET(1)] AS region_code, "
+        f"    SPLIT(line, '|')[OFFSET(2)] AS offer_type, "
+        f"    SPLIT(line, '|')[OFFSET(3)] AS version, "
+        f"    SPLIT(line, '|')[OFFSET(4)] AS source_url, "
+        f"    CURRENT_TIMESTAMP() AS loaded_at "
+        f"  FROM UNNEST(SPLIT(@rows_csv, '\\n')) AS line "
+        f"  WHERE line != '' "
+        f") S "
+        f"ON T.service_code = S.service_code "
+        f"   AND T.region_code = S.region_code "
+        f"   AND T.offer_type = S.offer_type "
+        f"WHEN MATCHED THEN UPDATE SET "
+        f"  version = S.version, loaded_at = S.loaded_at, source_url = S.source_url "
+        f"WHEN NOT MATCHED THEN "
+        f"  INSERT (service_code, region_code, offer_type, version, loaded_at, source_url) "
+        f"  VALUES (S.service_code, S.region_code, S.offer_type, S.version, S.loaded_at, S.source_url)"
+    )
+    bq_client.query(
+        sql,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("rows_csv", "STRING", rows_csv),
+            ]
+        ),
+    ).result()
+    logger.info("bq.versions.upserted_empty count=%d", len(empty_targets))
+
+
 def _swap_live_table(bq_client: bigquery.Client, settings: Settings, run_date: date) -> None:
     swap_sql = (
         f"CREATE OR REPLACE TABLE {_table_fqn(settings, LIVE_TABLE)}\n"
@@ -464,6 +522,11 @@ def run_load(
 
         # ---- 4) Download + transform + upload (parallel) ----
         rows_loaded = 0
+        # Targets whose offer file was legitimately empty (no priceDimensions).
+        # AWS publishes shell offers for some services (AmazonQuickSuite,
+        # newer/transitional services, etc.). We still need to record their
+        # `version` so the next run skips them via the diff — see step 7b.
+        empty_targets: list[aws_client.OfferTarget] = []
         if changed:
             with ThreadPoolExecutor(max_workers=settings.aws_max_workers) as pool:
                 futs = {
@@ -479,14 +542,29 @@ def run_load(
                     for t in changed
                 }
                 for fut in as_completed(futs):
-                    rows_loaded += fut.result()
-            log_memory("downloads.done", rows=rows_loaded)
+                    target = futs[fut]
+                    n = fut.result()
+                    rows_loaded += n
+                    if n == 0:
+                        empty_targets.append(target)
+            log_memory(
+                "downloads.done", rows=rows_loaded, empty=len(empty_targets)
+            )
 
-            if rows_loaded == 0:
-                # Every changed target returned zero rows — very suspicious; bail out
-                # rather than truncating today's partition with nothing.
+            # Safety: only bail if today's partition would end up genuinely
+            # empty — i.e. no rows from this run AND nothing to carry forward.
+            # The earlier "if rows_loaded == 0: raise" was too aggressive: it
+            # killed runs where a narrow service filter happened to only hit
+            # shell offers (zero priceDimensions), even though the live table
+            # was perfectly safe to keep at yesterday's snapshot.
+            will_have_data = (
+                rows_loaded > 0 or today_has_data or previous_date is not None
+            )
+            if not will_have_data:
                 raise RuntimeError(
-                    "Downloaded changed targets but produced zero rows; refusing to update."
+                    f"All {len(changed)} discovered targets yielded zero rows "
+                    f"AND there's no prior partition to carry forward from; "
+                    f"refusing to create an empty live table."
                 )
 
         # ---- 5) Prepare today's partition for the LOAD JOB ----
@@ -522,7 +600,9 @@ def run_load(
             f"{HISTORY_TABLE}${partition_decorator}"
         )
 
-        if changed:
+        # Skip the LOAD JOB if every changed target was an empty shell offer —
+        # there are no NDJSON files in the staging prefix to load.
+        if rows_loaded > 0:
             # NDJSON files are gzipped by upload_jsonl (extension .jsonl.gz).
             # BigQuery LOAD JOB transparently decompresses gzip for the
             # NEWLINE_DELIMITED_JSON source format, so no extra config needed.
@@ -554,10 +634,22 @@ def run_load(
                 getattr(load_job, "output_rows", None),
             )
             log_memory("load_job.done")
+        elif changed:
+            logger.warning(
+                "loader.empty_load all %d changed targets yielded zero rows; "
+                "skipping LOAD JOB but recording versions so they aren't re-fetched next run",
+                len(changed),
+            )
 
-        # ---- 7) Upsert version state for changed targets ----
-        if changed:
+        # ---- 7a) Upsert version state for changed targets that produced rows ----
+        if rows_loaded > 0:
             _merge_versions(bq_client, settings, run_date, changed_csv)
+
+        # ---- 7b) Upsert version state for empty shell offers ----
+        # These produced no history rows, so _merge_versions can't see them.
+        # Writing here is what stops the loader from re-fetching them every run.
+        if empty_targets:
+            _upsert_empty_target_versions(bq_client, settings, empty_targets)
 
         # ---- 8) Atomic swap of live table ----
         _swap_live_table(bq_client, settings, run_date)

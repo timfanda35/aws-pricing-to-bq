@@ -353,6 +353,90 @@ def test_run_load_force_ignores_known_versions(settings):
     assert result.services_skipped == 0
 
 
+def test_run_load_handles_empty_offers_without_bailing(settings):
+    """Some AWS services (e.g. AmazonQuickSuite us-east-1) legitimately publish
+    offer files with zero priceDimensions. The earlier `if rows_loaded == 0:
+    raise` killed runs that happened to only hit those. Now: skip the LOAD JOB,
+    record their versions independently so they aren't re-fetched next run,
+    and let the live table fall back to yesterday's snapshot or today's
+    pre-existing rows.
+    """
+    targets = [_target("AmazonQuickSuite", "us-east-1", "v_new")]
+    bq_client, _ = _mock_bq_client(
+        known_versions=[],
+        previous_date=date(2026, 5, 30),  # Have a previous partition to carry forward
+        today_has_data=False,
+    )
+    gcs_client, _ = _mock_gcs_client()
+
+    with (
+        patch.object(loader.aws_client, "discover_targets", return_value=targets),
+        patch.object(loader.aws_client, "download_offer_to_file", return_value=7836),
+        # Offer file parses to zero rows — empty shell offer.
+        patch.object(loader.transform, "offer_file_to_rows", return_value=iter([])),
+        # upload_jsonl forwards an empty iterator → returns 0 (no blob written).
+        patch.object(loader, "upload_jsonl", return_value=0),
+    ):
+        result = loader.run_load(
+            settings=settings, bq_client=bq_client, gcs_client=gcs_client
+        )
+
+    # Run completed — no exception.
+    assert result.rows_loaded == 0
+    assert result.services_changed == 1
+    assert result.services_skipped == 0
+
+    sqls = [c.args[0] for c in bq_client.query.call_args_list]
+    # No LOAD JOB submitted (nothing to load).
+    bq_client.load_table_from_uri.assert_not_called()
+    # The history-based version MERGE was NOT called (no history rows to derive from).
+    assert not any(
+        "MERGE" in s
+        and "aws_pricing_versions" in s
+        and "FROM `test-project.test_dataset.aws_pricing_history`" in s
+        for s in sqls
+    )
+    # But the empty-target version MERGE WAS called — stops the infinite-refetch loop.
+    empty_merge = next(
+        c
+        for c in bq_client.query.call_args_list
+        if "MERGE" in c.args[0]
+        and "aws_pricing_versions" in c.args[0]
+        and "@rows_csv" in c.args[0]
+    )
+    params = {p.name: p for p in empty_merge.kwargs["job_config"].query_parameters}
+    assert "AmazonQuickSuite|us-east-1|service|v_new|" in params["rows_csv"].value
+
+    # Live table swap still ran (carry-forward provided the rows).
+    assert any("CREATE OR REPLACE TABLE" in s for s in sqls)
+    # Carry-forward INSERT ran from previous partition.
+    assert any(
+        "INSERT INTO" in s and "@previous_date" in s and "@changed_csv" in s
+        for s in sqls
+    )
+
+
+def test_run_load_bails_when_no_rows_and_no_history_source(settings):
+    """The only situation where rows_loaded=0 IS a hard failure: first-ever run
+    with only empty shell offers in scope, so the live table would end up
+    completely empty.
+    """
+    targets = [_target("AmazonQuickSuite", "us-east-1", "v_new")]
+    bq_client, _ = _mock_bq_client(
+        known_versions=[], previous_date=None, today_has_data=False
+    )
+    gcs_client, _ = _mock_gcs_client()
+
+    with (
+        patch.object(loader.aws_client, "discover_targets", return_value=targets),
+        patch.object(loader.aws_client, "download_offer_to_file", return_value=7836),
+        patch.object(loader.transform, "offer_file_to_rows", return_value=iter([])),
+        patch.object(loader, "upload_jsonl", return_value=0),
+    ):
+        with pytest.raises(RuntimeError, match="empty live table"):
+            loader.run_load(settings=settings, bq_client=bq_client, gcs_client=gcs_client)
+
+
 def test_run_load_empty_discovery_refuses_to_proceed(settings):
     """If AWS returns no targets, loader must abort rather than swap a stale live table."""
     bq_client, _ = _mock_bq_client()
