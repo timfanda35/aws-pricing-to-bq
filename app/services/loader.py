@@ -167,7 +167,9 @@ def _download_one(
                 ingested_at_str=ingested_at_str,
                 include_reserved=settings.aws_include_reserved,
             )
-            blob_name = f"{staging_prefix}{_safe_blob_name(target)}.jsonl"
+            # `.jsonl.gz` — upload_jsonl gzips the file so the on-disk and
+            # on-GCS footprint stays ~10x smaller than uncompressed NDJSON.
+            blob_name = f"{staging_prefix}{_safe_blob_name(target)}.jsonl.gz"
             rows_written = upload_jsonl(
                 gcs_client, settings.gcs_staging_bucket, blob_name, rows_iter
             )
@@ -521,7 +523,10 @@ def run_load(
         )
 
         if changed:
-            source_uri = f"gs://{settings.gcs_staging_bucket}/{staging_prefix}*.jsonl"
+            # NDJSON files are gzipped by upload_jsonl (extension .jsonl.gz).
+            # BigQuery LOAD JOB transparently decompresses gzip for the
+            # NEWLINE_DELIMITED_JSON source format, so no extra config needed.
+            source_uri = f"gs://{settings.gcs_staging_bucket}/{staging_prefix}*.jsonl.gz"
             schema = bq_client.schema_from_json(str(HISTORY_SCHEMA_PATH))
             job_config = bigquery.LoadJobConfig(
                 source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,

@@ -61,7 +61,9 @@ def test_upload_jsonl_streams_rows_to_temp_file_and_uploads():
     assert count == 3
     assert len(captured) == 1
     blob = captured[0]
-    assert blob.name == "path/file.jsonl"
+    # `.gz` suffix is forced on the blob name so BigQuery LOAD JOB picks up the
+    # compression automatically via NEWLINE_DELIMITED_JSON + extension.
+    assert blob.name == "path/file.jsonl.gz"
     # 8 MiB chunk_size forces chunked resumable upload — the fix for the
     # 'write operation timed out' regression on million-row offers.
     assert blob.chunk_size == 8 * 1024 * 1024
@@ -69,8 +71,13 @@ def test_upload_jsonl_streams_rows_to_temp_file_and_uploads():
     assert blob.upload_attempts == 1
 
 
-def test_upload_jsonl_emits_one_ndjson_line_per_row(tmp_path):
-    """Inspect the temp file that upload_jsonl built before upload."""
+def test_upload_jsonl_writes_gzip_to_temp_file(tmp_path):
+    """Inspect the temp file that upload_jsonl built before upload — must be
+    gzipped NDJSON. On Cloud Run /tmp is RAM-backed; storing the unfortunately
+    bulky AWS pricing NDJSON uncompressed was the source of the EC2 us-east-1
+    OOM (~1.2 GB tmpfs per worker for ~1M rows). Gzip cuts that ~10x."""
+    import gzip as gz
+
     captured_path = {}
 
     class _Blob:
@@ -80,9 +87,8 @@ def test_upload_jsonl_emits_one_ndjson_line_per_row(tmp_path):
             self.chunk_size = kwargs.get("chunk_size")
 
         def upload_from_filename(self, path, *, content_type, timeout=None):
-            # Snapshot the file before the finally-block deletes it.
             captured_path["path"] = path
-            captured_path["content"] = open(path, "rb").read()
+            captured_path["raw"] = open(path, "rb").read()
 
     client = MagicMock()
     bucket = MagicMock()
@@ -92,7 +98,12 @@ def test_upload_jsonl_emits_one_ndjson_line_per_row(tmp_path):
     rows = [{"sku": "A", "n": 1}, {"sku": "B", "n": 2}]
     gcs_client.upload_jsonl(client, "bucket", "x.jsonl", iter(rows))
 
-    content = captured_path["content"].decode("utf-8")
+    raw = captured_path["raw"]
+    # Magic bytes: file must actually be gzipped.
+    assert raw[:2] == b"\x1f\x8b", "upload_jsonl must emit gzip-compressed NDJSON"
+
+    # Decompressed content matches the NDJSON we expect.
+    content = gz.decompress(raw).decode("utf-8")
     lines = [ln for ln in content.split("\n") if ln]
     assert len(lines) == 2
     assert json.loads(lines[0]) == {"sku": "A", "n": 1}

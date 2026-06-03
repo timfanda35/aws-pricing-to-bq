@@ -148,7 +148,9 @@ def test_run_load_first_run_no_previous_partition(settings):
     # ---- Upload happened ----
     assert upload_mock.call_count == 1
     upload_blob_name = upload_mock.call_args.args[2]
-    assert upload_blob_name.endswith(".jsonl")
+    # Gzipped NDJSON — BigQuery LOAD JOB decompresses transparently and tmpfs
+    # / GCS bandwidth drops ~10x vs raw .jsonl for AWS pricing rows.
+    assert upload_blob_name.endswith(".jsonl.gz")
     assert result.run_id in upload_blob_name
     # ---- LOAD JOB submitted to today's partition decorator ----
     bq_client.load_table_from_uri.assert_called_once()

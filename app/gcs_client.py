@@ -1,3 +1,4 @@
+import gzip
 import json
 import logging
 import os
@@ -42,11 +43,19 @@ def upload_jsonl(
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> int:
-    """Stream items as NDJSON via a temp file and upload to GCS in chunks.
+    """Stream items as gzipped NDJSON via a temp file and upload to GCS.
 
     Memory is bounded to one row at a time — important for AWS offers like
-    AWSComputeSavingsPlan/us-east-1 (~850K rows) or AmazonEC2/us-east-1 (~1M+ rows)
-    where buffering everything before upload would balloon RAM.
+    AmazonEC2/us-east-1 (~1M rows × ~1.2 KB/row uncompressed = ~1.2 GB NDJSON)
+    where buffering everything before upload would balloon RAM, and writing
+    uncompressed to Cloud Run's RAM-backed `/tmp` tmpfs would still cost the
+    full ~1.2 GB. JSON compresses ~10x for AWS pricing rows (the bulky
+    `attributes` field dominates and has lots of repeated keys), so the on-disk
+    cost during upload drops to ~120 MB per worker.
+
+    The output blob name is forced to end in `.jsonl.gz`. BigQuery LOAD JOB
+    transparently decompresses gzipped NEWLINE_DELIMITED_JSON, so the caller's
+    `*.jsonl.gz` glob in the LOAD URI Just Works.
 
     Uploads use chunked resumable transfers (8 MiB by default) so a single slow
     network write can't kill the whole upload, and the call is wrapped in a
@@ -54,14 +63,18 @@ def upload_jsonl(
 
     Returns the row count. If `items` is empty, no blob is created and 0 is returned.
     """
+    if not blob_name.endswith(".gz"):
+        blob_name = blob_name + ".gz"
     count = 0
-    with tempfile.NamedTemporaryFile(mode="wb", delete=False, suffix=".jsonl") as tmp:
+    with tempfile.NamedTemporaryFile(mode="wb", delete=False, suffix=".jsonl.gz") as tmp:
         tmp_path = tmp.name
+    # gzip-on-write at compresslevel=1: fast, ~10x reduction on AWS pricing rows.
+    with gzip.open(tmp_path, "wb", compresslevel=1) as out:
         for item in items:
-            tmp.write(
+            out.write(
                 json.dumps(item, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
             )
-            tmp.write(b"\n")
+            out.write(b"\n")
             count += 1
     try:
         if count == 0:

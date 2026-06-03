@@ -235,12 +235,12 @@ during an offer download:
 | Per worker (large offer in flight) | Cost |
 |---|---|
 | Downloaded offer JSON on `/tmp`, gzipped (EC2 us-east-1) | ~30 MB |
-| `products` lookup dict in Python (50K-100K SKUs × full attributes) | ~300 MB |
-| In-flight NDJSON temp file on `/tmp` | ~50 MB |
-| **Subtotal per worker** | **~380 MB** |
+| `products` lookup as raw JSON bytes (50K-100K SKUs, no Python object overhead) | ~310 MB |
+| In-flight NDJSON temp file on `/tmp`, gzipped (BQ LOAD reads `.jsonl.gz` natively) | ~120 MB |
+| **Subtotal per worker** | **~460 MB** |
 
 With `AWS_MAX_WORKERS=3` and Python runtime + libraries (~300 MB), total peak
-is ~1.5 GB — fits comfortably in a 4 GiB instance. Sizing reference:
+is ~1.7 GB — fits in a 4 GiB instance with margin. Sizing reference:
 
 | Cloud Run memory | Recommended `AWS_MAX_WORKERS` |
 |---|---|
